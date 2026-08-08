@@ -1,0 +1,130 @@
+name: Retry Oracle free-tier VM launch
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: pz-launch
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Configure OCI credentials
+        run: |
+          mkdir -p ~/.oci
+          umask 077
+          cat > ~/.oci/oci_api_key.pem <<'EOF'
+          ${{ secrets.OCI_PRIVATE_KEY }}
+          EOF
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/oci_api_key.pem ~/.oci/config
+
+      - name: Attempt launch (idempotent)
+        id: launch
+        env:
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+          COMPARTMENT: ${{ secrets.OCI_TENANCY_OCID }}
+          AD: ${{ secrets.OCI_AD }}
+          SUBNET: ${{ secrets.OCI_SUBNET_ID }}
+          IMAGE: ${{ secrets.OCI_IMAGE_ID }}
+          DISPLAY_NAME: pz-b42-server
+        run: |
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/pz_oracle.pub
+
+          EXISTING=$(oci compute instance list --compartment-id "$COMPARTMENT" \
+            --display-name "$DISPLAY_NAME" \
+            --query "data[?\"lifecycle-state\" != 'TERMINATED' && \"lifecycle-state\" != 'TERMINATING'] | [0].id" \
+            --raw-output 2>/dev/null)
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "status=already_exists" >> "$GITHUB_OUTPUT"
+            echo "instance_id=$EXISTING" >> "$GITHUB_OUTPUT"
+            PUBIP=$(oci compute instance list-vnics --instance-id "$EXISTING" --compartment-id "$COMPARTMENT" \
+              --query "data[0].\"public-ip\"" --raw-output 2>/dev/null)
+            echo "public_ip=$PUBIP" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          set +e
+          RESULT=$(oci compute instance launch \
+            --compartment-id "$COMPARTMENT" \
+            --availability-domain "$AD" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
+            --subnet-id "$SUBNET" \
+            --image-id "$IMAGE" \
+            --display-name "$DISPLAY_NAME" \
+            --assign-public-ip true \
+            --ssh-authorized-keys-file /tmp/pz_oracle.pub \
+            --wait-for-state RUNNING \
+            --max-wait-seconds 240 2>&1)
+          STATUS=$?
+          set -e
+
+          if [ $STATUS -eq 0 ]; then
+            INSTANCE_ID=$(echo "$RESULT" | grep -m1 '"id"' | sed -E 's/.*"id": *"([^"]+)".*/\1/')
+            PUBIP=$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --compartment-id "$COMPARTMENT" \
+              --query "data[0].\"public-ip\"" --raw-output 2>/dev/null)
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+            echo "public_ip=$PUBIP" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if echo "$RESULT" | grep -qi "out of host capacity\|OutOfCapacity\|InternalError.*capacity"; then
+            echo "status=no_capacity" >> "$GITHUB_OUTPUT"
+            echo "No capacity this round."
+            exit 0
+          fi
+
+          echo "status=error" >> "$GITHUB_OUTPUT"
+          echo "$RESULT"
+          exit 1
+
+      - name: Wait for SSH to come up
+        if: steps.launch.outputs.status == 'success'
+        run: sleep 30
+
+      - name: Deploy Project Zomboid
+        if: steps.launch.outputs.status == 'success' || steps.launch.outputs.status == 'already_exists'
+        env:
+          PUBLIC_IP: ${{ steps.launch.outputs.public_ip }}
+        run: |
+          mkdir -p ~/.ssh
+          umask 077
+          cat > /tmp/pz_oracle <<'EOF'
+          ${{ secrets.SSH_PRIVATE_KEY }}
+          EOF
+          chmod 600 /tmp/pz_oracle
+          scp -o StrictHostKeyChecking=accept-new -i /tmp/pz_oracle setup-pz-server.sh ubuntu@"$PUBLIC_IP":~/setup-pz-server.sh
+          ssh -o StrictHostKeyChecking=accept-new -i /tmp/pz_oracle ubuntu@"$PUBLIC_IP" \
+            "chmod +x ~/setup-pz-server.sh && ~/setup-pz-server.sh"
+
+      - name: Announce success
+        if: steps.launch.outputs.status == 'success' || steps.launch.outputs.status == 'already_exists'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLIC_IP: ${{ steps.launch.outputs.public_ip }}
+        run: |
+          echo "## PZ server is live :tada:" >> "$GITHUB_STEP_SUMMARY"
+          echo "Connect: \`$PUBLIC_IP:16261\`" >> "$GITHUB_STEP_SUMMARY"
+          gh issue create --title "PZ server is live: $PUBLIC_IP" \
+            --body "Project Zomboid B42 server is running at $PUBLIC_IP:16261. This workflow will now be a no-op on future runs (idempotent check)." \
+            || true
