@@ -103,7 +103,7 @@ jobs:
         run: sleep 30
 
       - name: Deploy Project Zomboid
-        if: steps.launch.outputs.status == 'success' || steps.launch.outputs.status == 'already_exists'
+        if: steps.launch.outputs.status == 'success'
         env:
           PUBLIC_IP: ${{ steps.launch.outputs.public_ip }}
         run: |
@@ -118,7 +118,7 @@ jobs:
             "chmod +x ~/setup-pz-server.sh && ~/setup-pz-server.sh"
 
       - name: Announce success
-        if: steps.launch.outputs.status == 'success' || steps.launch.outputs.status == 'already_exists'
+        if: steps.launch.outputs.status == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PUBLIC_IP: ${{ steps.launch.outputs.public_ip }}
@@ -126,5 +126,11 @@ jobs:
           echo "## PZ server is live :tada:" >> "$GITHUB_STEP_SUMMARY"
           echo "Connect: \`$PUBLIC_IP:16261\`" >> "$GITHUB_STEP_SUMMARY"
           gh issue create --title "PZ server is live: $PUBLIC_IP" \
-            --body "Project Zomboid B42 server is running at $PUBLIC_IP:16261. This workflow will now be a no-op on future runs (idempotent check)." \
+            --body "Project Zomboid B42 server is running at $PUBLIC_IP:16261." \
             || true
+
+      - name: Stop retrying (instance already exists or was just created)
+        if: steps.launch.outputs.status == 'success' || steps.launch.outputs.status == 'already_exists'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow disable retry-launch.yml || true
